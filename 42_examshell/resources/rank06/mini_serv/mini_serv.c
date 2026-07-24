@@ -1,8 +1,8 @@
 #include <arpa/inet.h>	// htonl、htons
 #include <netinet/in.h>	// sockaddr_in、INADDR_LOOPBACK
 #include <stdio.h>	// sprintf
-#include <stdlib.h>	// atoi、realloc、free、exit
-#include <string.h>	// bzero、memset、strstr、strlen、strcpy
+#include <stdlib.h>	// atoi、calloc、malloc、free、exit
+#include <string.h>	// bzero、memset、strlen、strcpy、strcat
 #include <sys/select.h>	// fd_set、select、FD系マクロ
 #include <sys/socket.h>	// socket、bind、listen、accept、recv、send
 #include <unistd.h>	// write、close
@@ -10,6 +10,7 @@
 /*
  * 読む順番は main -> create_listener -> run_server。
  * run_server の中で、接続・受信・送信・切断の4イベントを処理する。
+ * 配布main.cの extract_message / str_join / socket部分を再利用している。
  *
  * listen_fd : 新規接続を受け付ける fd
  * client fd : 接続した相手一人と通信する fd
@@ -62,8 +63,10 @@ static void
 	disconnect_client(t_server* server, int fd);
 static void
 	broadcast(t_server* server, int except_fd, const char* text);
-static void
-	append_text(char** dst, const char* src);
+static int
+	extract_message(char** buf, char** message);
+static char*
+	str_join(char* buf, const char* add);
 static void
 	fatal_error(void);
 
@@ -188,44 +191,43 @@ static void
 }
 
 /* ************************************************************************** */
-// recv した文字を input へ足し、完成した各行を全員へ配信する。
+// recvした文字をstr_joinで貯め、extract_messageで完成行を取り出す。
 static void
 	receive_client(t_server* server, int fd)
 {
 	t_client*	client;
-	char*		newline;
-	char*		remaining;
+	char*		message;
 	char		buffer[BUFFER_SIZE + 1];
 	char		prefix[MESSAGE_SIZE];
+	int			extracted;
 	int			received;
 
 	client = &server->clients[fd];	// fdに対応するクライアントを取得
-	received = recv(fd, buffer, BUFFER_SIZE, 0);	// 今読める分だけ受信
+	received = recv(fd, buffer, BUFFER_SIZE, 0);	// select後に1回だけrecv
 	if (received <= 0) {
 		disconnect_client(server, fd);	// 0以下なら切断として処理
 		return ;
 	}
 	buffer[received] = '\0';	// recvした末尾を文字列終端にする
-	// TCPでは1行が分割されて届くことがあるため、まず input へ貯める。
-	append_text(&client->input, buffer);	// 前回の未完成行へ連結
-	newline = strstr(client->input, "\n");	// 最初の改行を探す
-	while (newline) {
-		*newline = '\0';	// 改行位置で1行を一度区切る
+	client->input = str_join(client->input, buffer);	// 配布関数で受信分を連結
+	if (!client->input) {
+		fatal_error();	// str_joinのmalloc失敗
+	}
+	extracted = extract_message(&client->input, &message);	// 完成行を1つ取得
+	while (extracted == 1) {
 		sprintf(prefix, "client %d: ", client->id);	// 行頭の名札を作る
 		broadcast(server, fd, prefix);	// まず「client ID: 」を積む
-		broadcast(server, fd, client->input);	// 次に本文を積む
-		broadcast(server, fd, "\n");	// 最後に改行を積む
-		// 改行より後ろは、次の行または未完成行として残す。
-		remaining = NULL;	// 残り文字列の入れ物を空で開始
-		append_text(&remaining, newline + 1);	// 改行より後ろを保存
-		free(client->input);	// 処理済みの古い入力を解放
-		client->input = remaining;	// 未処理部分を次回へ持ち越す
-		newline = strstr(client->input, "\n");	// 次の改行を探す
+		broadcast(server, fd, message);	// messageは末尾の改行を含む
+		free(message);	// extract_messageが切り出した行を解放
+		extracted = extract_message(&client->input, &message);	// 次の行を取得
+	}
+	if (extracted < 0) {
+		fatal_error();	// extract_messageのcalloc失敗
 	}
 }
 
 /* ************************************************************************** */
-// output を送れる分だけ送り、残りがあれば次回用に保存する。
+// outputを送れる分だけ送り、未送信部分をstr_joinで複製する。
 static void
 	send_client(t_server* server, int fd)
 {
@@ -241,16 +243,15 @@ static void
 		disconnect_client(server, fd);	// 送れない相手を切断処理へ回す
 		return ;
 	}
-	// send は一度で全データを送るとは限らない。
-	if ((size_t)sent == length) {
-		free(client->output);	// 送信済みバッファを解放
-		client->output = NULL;	// 送信待ちなしに戻す
-	} else {
-		remaining = NULL;	// 残り文字列の入れ物を空で開始
-		append_text(&remaining, client->output + sent);	// 未送信部分だけ複製
-		free(client->output);	// 古い送信バッファを解放
-		client->output = remaining;	// 残りを次回のsendへ回す
+	remaining = NULL;	// 全部送れた場合はNULLのまま
+	if ((size_t)sent < length) {
+		remaining = str_join(NULL, client->output + sent);	// 未送信部分を複製
+		if (!remaining) {
+			fatal_error();	// str_joinのmalloc失敗
+		}
 	}
+	free(client->output);	// 古い送信バッファを解放
+	client->output = remaining;	// 残りを次回のsendへ回す
 }
 
 /* ************************************************************************** */
@@ -283,30 +284,69 @@ static void
 	while (fd <= server->max_fd) {
 		if (fd != server->listen_fd && fd != except_fd
 			&& FD_ISSET(fd, &server->active_fds)) {
-			append_text(&server->clients[fd].output, text);	// 各自の送信待ちへ追加
+			server->clients[fd].output = str_join(
+				server->clients[fd].output, text);	// 配布関数で送信待ちへ追加
+			if (!server->clients[fd].output) {
+				fatal_error();	// str_joinのmalloc失敗
+			}
 		}
 		fd++;
 	}
 }
 
 /* ************************************************************************** */
-// *dst の末尾へ src を連結する。realloc(NULL, n) は malloc(n) と同じ。
-static void
-	append_text(char** dst, const char* src)
+// 配布main.cの関数。bufから改行までをmessageへ切り出す。
+static int
+	extract_message(char** buf, char** message)
 {
-	char*	joined;
-	size_t	old_length;
+	char*	newbuf;
+	int		i;
 
-	old_length = 0;	// dstがNULLなら既存長は0
-	if (*dst) {
-		old_length = strlen(*dst);	// 既存文字列の長さを取得
+	*message = NULL;	// まだ取り出したメッセージはない
+	if (*buf == NULL) {
+		return (0);	// 受信文字列自体がない
 	}
-	joined = realloc(*dst, old_length + strlen(src) + 1);	// 連結後の大きさへ拡張
-	if (!joined) {
-		fatal_error();
+	i = 0;
+	while ((*buf)[i]) {
+		if ((*buf)[i] == '\n') {
+			newbuf = calloc(1, strlen(*buf + i + 1) + 1);	// 改行後の保存領域
+			if (!newbuf) {
+				return (-1);	// 呼び出し側でFatal errorにする
+			}
+			strcpy(newbuf, *buf + i + 1);	// 改行より後ろを保存
+			*message = *buf;	// 古いbufの所有権をmessageへ渡す
+			(*message)[i + 1] = '\0';	// 改行を含む1行で終端
+			*buf = newbuf;	// 未完成部分を次回へ持ち越す
+			return (1);	// 1行取り出せた
+		}
+		i++;
 	}
-	strcpy(joined + old_length, src);	// 既存文字列の末尾へコピー
-	*dst = joined;	// realloc後の新しいアドレスを保存
+	return (0);	// 改行がないので次のrecvを待つ
+}
+
+/* ************************************************************************** */
+// 配布main.cの関数。bufの末尾へaddを連結し、古いbufを解放する。
+static char*
+	str_join(char* buf, const char* add)
+{
+	char*	newbuf;
+	int		length;
+
+	length = 0;	// bufがNULLなら既存長は0
+	if (buf) {
+		length = strlen(buf);	// 既存文字列の長さ
+	}
+	newbuf = malloc(length + strlen(add) + 1);	// 連結後の大きさを確保
+	if (!newbuf) {
+		return (NULL);	// 呼び出し側でFatal errorにする
+	}
+	newbuf[0] = '\0';	// strcatできる空文字列にする
+	if (buf) {
+		strcat(newbuf, buf);	// 既存文字列をコピー
+	}
+	free(buf);	// 古い領域は不要
+	strcat(newbuf, add);	// 追加文字列を末尾へ連結
+	return (newbuf);
 }
 
 /* ************************************************************************** */
