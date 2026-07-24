@@ -7,192 +7,108 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-// write, close, select, socket, accept, listen, send, recv,
-// bind, strstr, malloc, realloc, free, calloc, bzero, atoi,
-// sprintf, strlen, exit, strcpy, strcat, memset, htonl, htons
-// FD_ZERO / FD_SET / FD_ISSET / FD_CLR は関数ではなく <sys/select.h> のマクロ。
-// select() に渡す fd_set を操作する道具、とまとめて覚える。
-
-// FD_ZERO   : 名簿を空にする
-// FD_SET    : fd を名簿に入れる
-// select    : 名簿を渡して、反応がある fd を待つ
-// FD_ISSET  : どの fd が反応したか確認する
-// FD_CLR    : 切断した fd を名簿から消す
+/*
+ * 読む順番は main -> create_listener -> run_server。
+ * run_server の中で、接続・受信・送信・切断の4イベントを処理する。
+ *
+ * listen_fd : 新規接続を受け付ける fd
+ * client fd : 接続した相手一人と通信する fd
+ * active_fds: 現在監視している fd の名簿
+ * read_fds  : 今回、読み込み可能だった fd の名簿
+ * write_fds : 今回、書き込み可能だった fd の名簿
+ *
+ * FD_ZERO=名簿を空にする、FD_SET=追加、FD_ISSET=確認、FD_CLR=削除。
+ * select は渡した名簿を書き換えるので、active_fds のコピーを渡す。
+ * man 2 select / socket / bind / listen / accept / recv / send、man 7 ip
+ */
 
 /* ************************************************************************** */
 
-// #define 禁止なので、名前付き定数は enum でまとめる。
 enum e_server_const {
-	MESSAGE_SIZE = 64,
 	LISTEN_BACKLOG = 128,
-	READ_SIZE = 4096
+	BUFFER_SIZE = 4096,
+	MESSAGE_SIZE = 64
 };
 
-// クライアント1人分。input は受信途中、output は送信待ちの文字列。
+// input は未完成の受信行、output はまだ send できていない文字列。
 typedef struct s_client {
-	int				fd;
-	int				id;
-	char*			input;
-	char*			output;
-	struct s_client*	next;
+	int		id;
+	char*	input;
+	char*	output;
 } t_client;
 
-// サーバ全体。active_fds は「今生きていて監視したい fd の名簿」。
+// clients[fd] として使うため、fd からクライアントをすぐ取得できる。
 typedef struct s_server {
 	int			listen_fd;
-	int			next_id;
 	int			max_fd;
-	t_client*	clients;
+	int			next_id;
 	fd_set		active_fds;
+	t_client	clients[FD_SETSIZE];
 } t_server;
 
 /* ************************************************************************** */
 
-// 1ファイル提出なので、先に static 関数のプロトタイプを並べる。
-static void
-	server_init(t_server* server, int port);
-static void
-	server_loop(t_server* server);
 static int
 	create_listener(int port);
 static void
-	prepare_write_fds(t_server* server, fd_set* write_fds);
+	run_server(t_server* server);
 static void
-	add_client(t_server* server);
+	accept_client(t_server* server);
 static void
-	read_client(t_server* server, int fd);
+	receive_client(t_server* server, int fd);
 static void
-	write_client(t_server* server, int fd);
-static void
-	process_input(t_server* server, t_client* client);
-static void
-	broadcast_line(t_server* server, t_client* sender, char* line);
+	send_client(t_server* server, int fd);
 static void
 	disconnect_client(t_server* server, int fd);
 static void
-	remove_client(t_server* server, int fd);
+	broadcast(t_server* server, int except_fd, const char* text);
 static void
-	broadcast(t_server* server, int except_fd, const char* msg);
-static void
-	queue_message(t_client* client, const char* msg);
-static void
-	drop_sent_prefix(t_client* client, int sent);
-static t_client*
-	find_client(t_server* server, int fd);
-static void
-	rebuild_max_fd(t_server* server);
-static char*
-	take_line(char** pending);
-static int
 	append_text(char** dst, const char* src);
-static int
-	find_newline(const char* str);
-static char*
-	xstrdup(const char* src);
-static void
-	put_error(const char* msg);
 static void
 	fatal_error(void);
 
 /* ************************************************************************** */
-// 引数を検証し、サーバを初期化してイベントループへ入る。
+// 引数を確認し、最初は接続受付用 fd だけを監視して開始する。
 int
 	main(int argc, char** argv)
 {
 	t_server	server;
 
 	if (argc != 2) {
-		put_error("Wrong number of arguments\n");
-		exit(1);
+		write(2, "Wrong number of arguments\n", 26);
+		return (1);
 	}
-	server_init(&server, atoi(argv[1]));
-	server_loop(&server);
+	memset(&server, 0, sizeof(server));
+	server.listen_fd = create_listener(atoi(argv[1]));
+	server.max_fd = server.listen_fd;
+	FD_ZERO(&server.active_fds);
+	FD_SET(server.listen_fd, &server.active_fds);
+	run_server(&server);
 	return (0);
 }
 
 /* ************************************************************************** */
-// listen 用 fd を作り、select() で監視する fd_set を初期化する。
-static void
-	server_init(t_server* server, int port)
-{
-	// 構造体をゼロ初期化すると、clients/input/output は NULL から始まる。
-	memset(server, 0, sizeof(*server));
-	// active_fds を空にしてから、listen_fd だけを最初の監視対象にする。
-	FD_ZERO(&server->active_fds);
-	server->listen_fd = create_listener(port);
-	server->max_fd = server->listen_fd;
-	FD_SET(server->listen_fd, &server->active_fds);
-}
-
-/* ************************************************************************** */
-// select() で新規接続、受信可能 fd、送信可能 fd を順番に処理する。
-static void
-	server_loop(t_server* server)
-{
-	fd_set		read_fds;
-	fd_set		write_fds;
-	t_client*	client;
-	t_client*	next;
-
-	while (1) {
-		// active_fds は本物の名簿。select() は渡された fd_set を書き換える。
-		// だから毎回コピーを作り、コピーの方を select() に渡す。
-		read_fds = server->active_fds;
-		// 書き込み監視は output がある client だけ。空なら send する物がない。
-		prepare_write_fds(server, &write_fds);
-		// ここで、どれかの fd が読める/書ける状態になるまで待つ。
-		if (select(server->max_fd + 1, &read_fds, &write_fds, NULL, NULL) < 0) {
-			fatal_error();
-		}
-		// listen_fd が読めるなら、新しい接続が来た合図。accept() する。
-		if (FD_ISSET(server->listen_fd, &read_fds)) {
-			add_client(server);
-		}
-		client = server->clients;
-		while (client) {
-			// read_client() 内で client が消える可能性があるので先に next を避難。
-			next = client->next;
-			// client fd が読めるなら、相手が送信したか切断したということ。
-			if (FD_ISSET(client->fd, &read_fds)) {
-				read_client(server, client->fd);
-			}
-			client = next;
-		}
-		client = server->clients;
-		while (client) {
-			next = client->next;
-			// client fd が書けるなら、貯めていた output を送れる。
-			if (FD_ISSET(client->fd, &write_fds)) {
-				write_client(server, client->fd);
-			}
-			client = next;
-		}
-	}
-}
-
-/* ************************************************************************** */
-// 127.0.0.1 の指定ポートで待ち受けるソケットを作る。
+// socket -> bind -> listen で、127.0.0.1:port の受付を作る。
 static int
 	create_listener(int port)
 {
-	struct sockaddr_in	addr;
+	struct sockaddr_in	address;
 	int					fd;
 
-	// AF_INET は IPv4、SOCK_STREAM は TCP。ここで待ち受け用 fd を作る。
 	fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (fd < 0) {
 		fatal_error();
 	}
-	// sockaddr_in に「IPv4 / 127.0.0.1 / 指定 port」という住所を詰める。
-	bzero(&addr, sizeof(addr));
-	addr.sin_family = AF_INET;
-	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-	addr.sin_port = htons(port);
-	// bind は「この fd をこの IP:port で使う」と OS に登録する。
-	if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+	/* sockaddr_in は IPv4 の住所（man 7 ip）。
+	 * htonl/htons は数値を通信で使うバイト順へ変換する。 */
+	bzero(&address, sizeof(address));
+	address.sin_family = AF_INET;
+	address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	address.sin_port = htons(port);
+	// bind は fd に住所を登録する。引数型に合わせ sockaddr* へ変換する。
+	if (bind(fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
 		fatal_error();
 	}
-	// listen 後、この fd は accept() で新規接続を受け取れるようになる。
 	if (listen(fd, LISTEN_BACKLOG) < 0) {
 		fatal_error();
 	}
@@ -200,395 +116,204 @@ static int
 }
 
 /* ************************************************************************** */
-// output に未送信データがあるクライアントだけ write_fds に入れる。
+// select で反応を待ち、可能になった fd の処理だけを行う。
 static void
-	prepare_write_fds(t_server* server, fd_set* write_fds)
+	run_server(t_server* server)
 {
-	t_client*	client;
+	fd_set	read_fds;
+	fd_set	write_fds;
+	int		fd;
 
-	// write_fds は毎回作り直す。送信待ちがある fd だけ入れるため。
-	FD_ZERO(write_fds);
-	client = server->clients;
-	while (client) {
-		if (client->output) {
-			FD_SET(client->fd, write_fds);
+	while (1) {
+		read_fds = server->active_fds;
+		FD_ZERO(&write_fds);
+		fd = 0;
+		while (fd <= server->max_fd) {
+			if (fd != server->listen_fd
+				&& FD_ISSET(fd, &server->active_fds)
+				&& server->clients[fd].output) {
+				FD_SET(fd, &write_fds);
+			}
+			fd++;
 		}
-		client = client->next;
+		if (select(server->max_fd + 1, &read_fds,
+				&write_fds, NULL, NULL) < 0) {
+			fatal_error();
+		}
+		// listen_fd が読めるのは、新しい接続が待っている合図。
+		if (FD_ISSET(server->listen_fd, &read_fds)) {
+			accept_client(server);
+		}
+		fd = 0;
+		while (fd <= server->max_fd) {
+			if (fd != server->listen_fd
+				&& FD_ISSET(fd, &server->active_fds)) {
+				if (FD_ISSET(fd, &read_fds)) {
+					receive_client(server, fd);
+				}
+				// receive_client で切断されていない場合だけ送信する。
+				if (FD_ISSET(fd, &server->active_fds)
+					&& FD_ISSET(fd, &write_fds)) {
+					send_client(server, fd);
+				}
+			}
+			fd++;
+		}
 	}
 }
 
 /* ************************************************************************** */
-// accept() したクライアントへ ID を付け、既存クライアントへ入室通知を積む。
+// accept でクライアント専用 fd を受け取り、IDと監視を追加する。
 static void
-	add_client(t_server* server)
+	accept_client(t_server* server)
 {
-	t_client*	client;
-	char		msg[MESSAGE_SIZE];
-	int			fd;
+	char	message[MESSAGE_SIZE];
+	int		fd;
 
-	// accept は新しい client 専用 fd を返す。listen_fd とは別物。
 	fd = accept(server->listen_fd, NULL, NULL);
-	if (fd < 0) {
+	if (fd < 0 || fd >= FD_SETSIZE) {
+		if (fd >= 0) {
+			close(fd);
+		}
 		fatal_error();
 	}
-	// calloc なので input/output/next は NULL 初期化される。
-	client = calloc(1, sizeof(t_client));
-	if (!client) {
-		close(fd);
-		fatal_error();
-	}
-	client->fd = fd;
-	// ID は 0, 1, 2... と増える。切断されても再利用しない。
-	client->id = server->next_id++;
-	// 連結リストの先頭に追加する。順番は評価出力に影響しない。
-	client->next = server->clients;
-	server->clients = client;
-	// 次回以降 select() でこの client fd も読む対象にする。
+	server->clients[fd].id = server->next_id++;
 	FD_SET(fd, &server->active_fds);
 	if (fd > server->max_fd) {
 		server->max_fd = fd;
 	}
-	sprintf(msg, "server: client %d just arrived\n", client->id);
-	broadcast(server, fd, msg);
+	sprintf(message, "server: client %d just arrived\n",
+		server->clients[fd].id);
+	broadcast(server, fd, message);
 }
 
 /* ************************************************************************** */
-// recv() した文字列を input に足し、完成した行だけ broadcast する。
+// recv した文字を input へ足し、完成した各行を全員へ配信する。
 static void
-	read_client(t_server* server, int fd)
+	receive_client(t_server* server, int fd)
 {
 	t_client*	client;
-	char		buf[READ_SIZE + 1];
-	int			bytes;
+	char*		newline;
+	char*		remaining;
+	char		buffer[BUFFER_SIZE + 1];
+	char		prefix[MESSAGE_SIZE];
+	int			received;
 
-	client = find_client(server, fd);
-	if (!client) {
-		return ;
-	}
-	// recv が 0 以下なら、相手が切断したか通信エラー。退出扱いにする。
-	bytes = recv(fd, buf, READ_SIZE, 0);
-	if (bytes <= 0) {
+	client = &server->clients[fd];
+	received = recv(fd, buffer, BUFFER_SIZE, 0);
+	if (received <= 0) {
 		disconnect_client(server, fd);
 		return ;
 	}
-	// TCP は行単位では届かないので、受け取った分をまず input に足す。
-	buf[bytes] = '\0';
-	if (!append_text(&client->input, buf)) {
-		fatal_error();
+	buffer[received] = '\0';
+	// TCPでは1行が分割されて届くことがあるため、まず input へ貯める。
+	append_text(&client->input, buffer);
+	newline = strstr(client->input, "\n");
+	while (newline) {
+		*newline = '\0';
+		sprintf(prefix, "client %d: ", client->id);
+		broadcast(server, fd, prefix);
+		broadcast(server, fd, client->input);
+		broadcast(server, fd, "\n");
+		// 改行より後ろは、次の行または未完成行として残す。
+		remaining = NULL;
+		append_text(&remaining, newline + 1);
+		free(client->input);
+		client->input = remaining;
+		newline = strstr(client->input, "\n");
 	}
-	process_input(server, client);
 }
 
 /* ************************************************************************** */
-// output の送信待ちデータを send() し、送れた分だけ削る。
+// output を送れる分だけ送り、残りがあれば次回用に保存する。
 static void
-	write_client(t_server* server, int fd)
+	send_client(t_server* server, int fd)
 {
 	t_client*	client;
-	int			sent;
+	char*		remaining;
+	size_t		length;
+	ssize_t		sent;
 
-	client = find_client(server, fd);
-	if (!client || !client->output) {
-		return ;
-	}
-	// send は output 全部を一度に送れるとは限らない。戻り値が送れたバイト数。
-	sent = send(fd, client->output, strlen(client->output), 0);
+	client = &server->clients[fd];
+	length = strlen(client->output);
+	sent = send(fd, client->output, length, 0);
 	if (sent <= 0) {
 		disconnect_client(server, fd);
 		return ;
 	}
-	drop_sent_prefix(client, sent);
-}
-
-/* ************************************************************************** */
-// input から '\n' までの行を取り出せるだけ処理する。
-static void
-	process_input(t_server* server, t_client* client)
-{
-	char*	line;
-
-	while (client->input) {
-		// 改行がまだ無ければ NULL が返る。その場合は次の recv を待つ。
-		line = take_line(&client->input);
-		if (!line) {
-			return ;
-		}
-		broadcast_line(server, client, line);
-		free(line);
+	// send は一度で全データを送るとは限らない。
+	if ((size_t)sent == length) {
+		free(client->output);
+		client->output = NULL;
+	} else {
+		remaining = NULL;
+		append_text(&remaining, client->output + sent);
+		free(client->output);
+		client->output = remaining;
 	}
 }
 
 /* ************************************************************************** */
-// 1行の先頭に client ID を付け、送信者以外へ送信待ちとして積む。
-static void
-	broadcast_line(t_server* server, t_client* sender, char* line)
-{
-	char	prefix[MESSAGE_SIZE];
-	char*	msg;
-
-	sprintf(prefix, "client %d: ", sender->id);
-	// +2 は末尾に足す \n と \0 の分。
-	msg = malloc(strlen(prefix) + strlen(line) + 2);
-	if (!msg) {
-		fatal_error();
-	}
-	strcpy(msg, prefix);
-	strcat(msg, line);
-	strcat(msg, "\n");
-	broadcast(server, sender->fd, msg);
-	free(msg);
-}
-
-/* ************************************************************************** */
-// 切断したクライアントを消し、残りのクライアントへ退出通知を積む。
+// 切断した fd を名簿から外し、メモリと fd を解放する。
 static void
 	disconnect_client(t_server* server, int fd)
 {
-	t_client*	client;
-	char		msg[MESSAGE_SIZE];
+	char	message[MESSAGE_SIZE];
+	int		id;
 
-	client = find_client(server, fd);
-	if (!client) {
-		return ;
-	}
-	sprintf(msg, "server: client %d just left\n", client->id);
-	remove_client(server, fd);
-	broadcast(server, fd, msg);
+	id = server->clients[fd].id;
+	FD_CLR(fd, &server->active_fds);
+	close(fd);
+	free(server->clients[fd].input);
+	free(server->clients[fd].output);
+	server->clients[fd].input = NULL;
+	server->clients[fd].output = NULL;
+	sprintf(message, "server: client %d just left\n", id);
+	broadcast(server, -1, message);
 }
 
 /* ************************************************************************** */
-// fd_set とリストからクライアントを外し、fd と動的メモリを解放する。
+// except_fd 以外の全クライアントへ送信待ち文字列を追加する。
 static void
-	remove_client(t_server* server, int fd)
+	broadcast(t_server* server, int except_fd, const char* text)
 {
-	t_client*	client;
-	t_client*	prev;
+	int	fd;
 
-	client = server->clients;
-	prev = NULL;
-	while (client) {
-		if (client->fd == fd) {
-			if (prev) {
-				prev->next = client->next;
-			} else {
-				server->clients = client->next;
-			}
-			// 閉じた fd を select() しないように、名簿から外してから close。
-			FD_CLR(client->fd, &server->active_fds);
-			close(client->fd);
-			free(client->input);
-			free(client->output);
-			free(client);
-			if (fd == server->max_fd) {
-				rebuild_max_fd(server);
-			}
-			return ;
+	fd = 0;
+	while (fd <= server->max_fd) {
+		if (fd != server->listen_fd && fd != except_fd
+			&& FD_ISSET(fd, &server->active_fds)) {
+			append_text(&server->clients[fd].output, text);
 		}
-		prev = client;
-		client = client->next;
+		fd++;
 	}
 }
 
 /* ************************************************************************** */
-// except_fd 以外の全クライアントへ同じメッセージを積む。
+// *dst の末尾へ src を連結する。realloc(NULL, n) は malloc(n) と同じ。
 static void
-	broadcast(t_server* server, int except_fd, const char* msg)
-{
-	t_client*	client;
-
-	client = server->clients;
-	while (client) {
-		if (client->fd != except_fd) {
-			queue_message(client, msg);
-		}
-		client = client->next;
-	}
-}
-
-/* ************************************************************************** */
-// クライアントごとの送信待ちバッファ output に文字列を追加する。
-static void
-	queue_message(t_client* client, const char* msg)
-{
-	if (!append_text(&client->output, msg)) {
-		fatal_error();
-	}
-}
-
-/* ************************************************************************** */
-// send() 済みの先頭部分を output から取り除く。
-static void
-	drop_sent_prefix(t_client* client, int sent)
-{
-	char*	rest;
-
-	if (!client->output) {
-		return ;
-	}
-	// 全部送れたなら output を空にする。残りがあるなら先頭だけ削る。
-	if ((size_t)sent >= strlen(client->output)) {
-		free(client->output);
-		client->output = NULL;
-		return ;
-	}
-	rest = xstrdup(client->output + sent);
-	if (!rest) {
-		fatal_error();
-	}
-	free(client->output);
-	client->output = rest;
-}
-
-/* ************************************************************************** */
-// fd に対応するクライアント構造体を連結リストから探す。
-static t_client*
-	find_client(t_server* server, int fd)
-{
-	t_client*	client;
-
-	client = server->clients;
-	while (client) {
-		if (client->fd == fd) {
-			return (client);
-		}
-		client = client->next;
-	}
-	return (NULL);
-}
-
-/* ************************************************************************** */
-// 最大 fd が閉じられた後、select() 用の max_fd を再計算する。
-static void
-	rebuild_max_fd(t_server* server)
-{
-	t_client*	client;
-
-	server->max_fd = server->listen_fd;
-	client = server->clients;
-	while (client) {
-		if (client->fd > server->max_fd) {
-			server->max_fd = client->fd;
-		}
-		client = client->next;
-	}
-}
-
-/* ************************************************************************** */
-// pending から完成済みの1行を切り出し、未完成分だけ pending に残す。
-static char*
-	take_line(char** pending)
-{
-	char*	line;
-	char*	rest;
-	int		newline;
-	int		i;
-
-	if (!pending || !*pending) {
-		return (NULL);
-	}
-	// pending に改行がある時だけ、1行として broadcast できる。
-	newline = find_newline(*pending);
-	if (newline < 0) {
-		return (NULL);
-	}
-	line = malloc(newline + 1);
-	if (!line) {
-		fatal_error();
-	}
-	i = 0;
-	while (i < newline) {
-		line[i] = (*pending)[i];
-		i++;
-	}
-	line[i] = '\0';
-	// 改行の後ろは、次の行の途中かもしれないので pending に戻す。
-	rest = xstrdup(*pending + newline + 1);
-	if (!rest) {
-		fatal_error();
-	}
-	free(*pending);
-	if (rest[0] == '\0') {
-		free(rest);
-		rest = NULL;
-	}
-	*pending = rest;
-	return (line);
-}
-
-/* ************************************************************************** */
-// dst の末尾に src を連結し、古い dst は解放する。
-static int
 	append_text(char** dst, const char* src)
 {
 	char*	joined;
-	size_t	old_len;
-	size_t	add_len;
+	size_t	old_length;
 
-	old_len = 0;
+	old_length = 0;
 	if (*dst) {
-		old_len = strlen(*dst);
+		old_length = strlen(*dst);
 	}
-	add_len = strlen(src);
-	// 既存分 + 追加分 + 終端 NUL のサイズを確保する。
-	joined = malloc(old_len + add_len + 1);
+	joined = realloc(*dst, old_length + strlen(src) + 1);
 	if (!joined) {
-		return (0);
+		fatal_error();
 	}
-	joined[0] = '\0';
-	if (*dst) {
-		strcpy(joined, *dst);
-	}
-	strcat(joined, src);
-	free(*dst);
+	strcpy(joined + old_length, src);
 	*dst = joined;
-	return (1);
 }
 
 /* ************************************************************************** */
-// 文字列中の最初の改行位置を返す。見つからなければ -1 を返す。
-static int
-	find_newline(const char* str)
-{
-	int	i;
-
-	i = 0;
-	while (str[i]) {
-		if (str[i] == '\n') {
-			return (i);
-		}
-		i++;
-	}
-	return (-1);
-}
-
-/* ************************************************************************** */
-// allowed functions だけで使える小さな strdup 互換関数。
-static char*
-	xstrdup(const char* src)
-{
-	char*	dst;
-
-	dst = malloc(strlen(src) + 1);
-	if (!dst) {
-		return (NULL);
-	}
-	strcpy(dst, src);
-	return (dst);
-}
-
-/* ************************************************************************** */
-// 標準エラーへ指定文字列を出力する。
-static void
-	put_error(const char* msg)
-{
-	write(2, msg, strlen(msg));
-}
-
-/* ************************************************************************** */
-// fatal error を出して即終了する。
+// 致命的エラーを標準エラーへ出して終了する。
 static void
 	fatal_error(void)
 {
-	put_error("Fatal error\n");
+	write(2, "Fatal error\n", 12);
 	exit(1);
 }

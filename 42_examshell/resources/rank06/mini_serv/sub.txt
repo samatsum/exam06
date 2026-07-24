@@ -1,42 +1,64 @@
 Assignment name  : mini_serv
 Expected files   : mini_serv.c
-Allowed functions: write, close, select, socket, accept, listen, send, recv, bind, strstr, malloc, realloc, free, calloc, bzero, atoi, sprintf, strlen, exit, strcpy, strcat, memset
+Allowed functions: write, close, select, socket, accept, listen, send, recv, bind, strstr, malloc, realloc, free, calloc, bzero, atoi, sprintf, strlen, exit, strcpy, strcat, memset, htonl, htons
 --------------------------------------------------------------------------------
 
 Write a program that will listen for client to connect on a certain port on 127.0.0.1 and will let clients to speak with each other
+127.0.0.1 の指定したポートでクライアントの接続を待ち受け、クライアント同士が会話できるようにするプログラムを書いてください。
 
 This program will take as first argument the port to bind to
+このプログラムは、バインドするポートを最初の引数として受け取ります。
 If no argument is given, it should write in stderr "Wrong number of arguments" followed by a \n and exit with status 1
+引数が与えられない場合は、標準エラー出力に "Wrong number of arguments" を \n 付きで出力し、ステータス 1 で終了します。
 If a System Calls returns an error before the program start accepting connection, it should write in stderr "Fatal error" followed by a \n and exit with status 1
+プログラムが接続受付を開始する前にシステムコールがエラーを返した場合は、標準エラー出力に "Fatal error" を \n 付きで出力し、ステータス 1 で終了します。
 If you cant allocate memory it should write in stderr "Fatal error" followed by a \n and exit with status 1
+メモリを確保できない場合は、標準エラー出力に "Fatal error" を \n 付きで出力し、ステータス 1 で終了します。
 
 Your program must be non-blocking but client can be lazy and if they don't read your message you must NOT disconnect them...
+プログラムはノンブロッキングでなければなりませんが、クライアントは遅くてもかまいません。メッセージを読まなくても切断してはいけません...
 
 Your program must not contains #define preproc
+プログラム内に `#define` のプリプロセッサを含めてはいけません。
 Your program must only listen to 127.0.0.1
+プログラムは 127.0.0.1 のみを待ち受けなければなりません。
 The fd that you will receive will already be set to make 'recv' or 'send' to block if select hasn't be called before calling them, but will not block otherwise. 
+受け取る fd は、事前に select を呼んでいなければ `recv` や `send` がブロックするように設定されており、それ以外ではブロックしません。
 
 When a client connect to the server:
+クライアントがサーバーに接続したとき:
 - the client will be given an id. the first client will receive the id 0 and each new client will received the last client id + 1
+- クライアントには ID が割り当てられます。最初のクライアントは ID 0 を受け取り、その後に接続する新しいクライアントは直前のクライアント ID + 1 を受け取ります。
 - %d will be replace by this number
+- `%d` はこの番号に置き換えられます。
 - a message is sent to all the client that was connected to the server: "server: client %d just arrived\n"
+- サーバーに接続しているすべてのクライアントへ、"server: client %d just arrived\n" というメッセージが送信されます。
 
 clients must be able to send messages to your program.
+クライアントはプログラムにメッセージを送信できなければなりません。
 - message will only be printable characters, no need to check
+- メッセージは印字可能文字のみで、チェックは不要です。
 - a single message can contains multiple \n
+- 1 つのメッセージに複数の \n を含めることができます。
 - when the server receive a message, it must resend it to all the other client with "client %d: " before every line!
+- サーバーがメッセージを受信したら、各行の前に "client %d: " を付けて、他のすべてのクライアントに再送しなければなりません!
 
 When a client disconnect from the server:
+クライアントがサーバーから切断したとき:
 - a message is sent to all the client that was connected to the server: "server: client %d just left\n"
+- サーバーに接続していたすべてのクライアントへ、"server: client %d just left\n" というメッセージが送信されます。
 
 Memory or fd leaks are forbidden
-
+メモリリークや fd リークは禁止です。
 To help you, you will find the file main.c with the beginning of a server and maybe some useful functions. (Beware this file use forbidden functions or write things that must not be there in your final program)
-
+役に立つように、サーバーの雛形といくつかの便利な関数を含む main.c が用意されています。（このファイルには禁止された関数が使われていたり、最終プログラムにあってはいけない記述が含まれている場合があるので注意してください）
 Warning our tester is expecting that you send the messages as fast as you can. Don't do un-necessary buffer.
-
+注意: テスターは、メッセージをできるだけ速く送信することを期待しています。不要なバッファリングはしないでください。
 Evaluation can be a bit longer than usual...
-
+評価には通常より少し時間がかかる場合があります...
 Hint: you can use nc to test your program
+ヒント: テストには nc を使えます。
 Hint: you should use nc to test your program
+ヒント: テストには nc を使うべきです。
 Hint: To test you can use fcntl(fd, F_SETFL, O_NONBLOCK) but use select and NEVER check EAGAIN (man 2 send)
+ヒント: テストでは `fcntl(fd, F_SETFL, O_NONBLOCK)` を使えますが、select を使い、EAGAIN を決して確認しないでください（man 2 send）
