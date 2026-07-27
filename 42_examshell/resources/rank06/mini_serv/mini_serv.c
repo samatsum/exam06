@@ -47,10 +47,7 @@ typedef struct s_server {
 	t_client	clients[FD_SETSIZE];	// fdを添字にしたクライアント表
 } t_server;
 
-/* ************************************************************************** */
 
-static int
-	create_listener(int port);
 static void
 	run_server(t_server* server);
 static void
@@ -67,6 +64,8 @@ static int
 	extract_message(char** buf, char** message);
 static char*
 	str_join(char* buf, const char* add);
+static int
+	create_listener(int port);
 static void
 	fatal_error(void);
 
@@ -139,8 +138,7 @@ static void
 			}
 			fd++;
 		}
-		if (select(server->max_fd + 1, &read_fds,
-				&write_fds, NULL, NULL) < 0) {
+		if (select(server->max_fd + 1, &read_fds, &write_fds, NULL, NULL) < 0) {
 			fatal_error();
 		}
 		// listen_fd が読めるのは、新しい接続が待っている合図。
@@ -149,14 +147,12 @@ static void
 		}
 		fd = 0;	// 再びfdを0番から調べる
 		while (fd <= server->max_fd) {
-			if (fd != server->listen_fd
-				&& FD_ISSET(fd, &server->active_fds)) {
+			if (fd != server->listen_fd && FD_ISSET(fd, &server->active_fds)) {
 				if (FD_ISSET(fd, &read_fds)) {
 					receive_client(server, fd);	// 届いたデータを読む
 				}
 				// receive_client で切断されていない場合だけ送信する。
-				if (FD_ISSET(fd, &server->active_fds)
-					&& FD_ISSET(fd, &write_fds)) {
+				if (FD_ISSET(fd, &server->active_fds) && FD_ISSET(fd, &write_fds)) {
 					send_client(server, fd);	// 送信待ちデータを送る
 				}
 			}
@@ -173,6 +169,7 @@ static void
 	char	message[MESSAGE_SIZE];
 	int		fd;
 
+	//OSから、新しいクライアントと通信するためのFD番号を返してもらう
 	fd = accept(server->listen_fd, NULL, NULL);	// 相手専用の新しいfdを受け取る
 	if (fd < 0 || fd >= FD_SETSIZE) {
 		if (fd >= 0) {
@@ -185,8 +182,7 @@ static void
 	if (fd > server->max_fd) {
 		server->max_fd = fd;	// select用の最大fdを更新
 	}
-	sprintf(message, "server: client %d just arrived\n",
-		server->clients[fd].id);
+	sprintf(message, "server: client %d just arrived\n", server->clients[fd].id);
 	broadcast(server, fd, message);	// 新人以外へ入室通知を積む
 }
 
@@ -282,10 +278,8 @@ static void
 
 	fd = 0;	// 全fdを先頭から確認
 	while (fd <= server->max_fd) {
-		if (fd != server->listen_fd && fd != except_fd
-			&& FD_ISSET(fd, &server->active_fds)) {
-			server->clients[fd].output = str_join(
-				server->clients[fd].output, text);	// 配布関数で送信待ちへ追加
+		if (fd != server->listen_fd && fd != except_fd && FD_ISSET(fd, &server->active_fds)) {
+			server->clients[fd].output = str_join(server->clients[fd].output, text);	// 配布関数で送信待ちへ追加
 			if (!server->clients[fd].output) {
 				fatal_error();	// str_joinのmalloc失敗
 			}
