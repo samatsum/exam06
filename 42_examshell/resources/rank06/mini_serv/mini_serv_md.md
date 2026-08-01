@@ -1,11 +1,3 @@
-#include <arpa/inet.h>	// htonl、htons
-#include <netinet/in.h>	// sockaddr_in、INADDR_LOOPBACK
-#include <stdio.h>	// sprintf
-#include <stdlib.h>	// atoi、calloc、malloc、free、exit
-#include <string.h>	// bzero、memset、strlen、strcpy、strcat
-#include <sys/select.h>	// fd_set、select、FD系マクロ
-#include <sys/socket.h>	// socket、bind、listen、accept、recv、send
-#include <unistd.h>	// write、close
 
 /*
  * 読む順番は main -> create_listener -> run_server。
@@ -47,28 +39,6 @@ typedef struct s_server {
 	t_client	clients[FD_SETSIZE];	// fdを添字にしたクライアント表
 } t_server;
 
-
-static void
-	run_server(t_server* server);
-static void
-	accept_client(t_server* server);
-static void
-	receive_client(t_server* server, int fd);
-static void
-	send_client(t_server* server, int fd);
-static void
-	disconnect_client(t_server* server, int fd);
-static void
-	broadcast(t_server* server, int except_fd, const char* text);
-static int
-	extract_message(char** buf, char** message);
-static char*
-	str_join(char* buf, const char* add);
-static int
-	create_listener(int port);
-static void
-	fatal_error(void);
-
 /* ************************************************************************** */
 // 引数を確認し、最初は接続受付用 fd だけを監視して開始する。
 int
@@ -108,7 +78,7 @@ static int
 	address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);	// 127.0.0.1だけで待つ
 	address.sin_port = htons(port);	// ポートを通信用バイト順へ変換
 	// bind は fd に住所を登録する。引数型に合わせ sockaddr* へ変換する。
-	if (bind(fd, (struct sockaddr*)&address, sizeof(address)) < 0) {	// fdへIPアドレスとポートを登録
+	if (bind(fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
 		fatal_error();
 	}
 	if (listen(fd, LISTEN_BACKLOG) < 0) {	// 接続を受け付けられる状態へ変更
@@ -206,6 +176,9 @@ static void
 	}
 	buffer[received] = '\0';	// recvした末尾を文字列終端にする
 	client->input = str_join(client->input, buffer);	// 配布関数で受信分を連結
+	if (!client->input) {
+		fatal_error();	// str_joinのmalloc失敗
+	}
 	extracted = extract_message(&client->input, &message);	// 完成行を1つ取得
 	while (extracted == 1) {
 		sprintf(prefix, "client %d: ", client->id);	// 行頭の名札を作る
@@ -239,6 +212,9 @@ static void
 	remaining = NULL;	// 全部送れた場合はNULLのまま
 	if ((size_t)sent < length) {
 		remaining = str_join(NULL, client->output + sent);	// 未送信部分を複製
+		if (!remaining) {
+			fatal_error();	// str_joinのmalloc失敗
+		}
 	}
 	free(client->output);	// 古い送信バッファを解放
 	client->output = remaining;	// 残りを次回のsendへ回す
@@ -273,7 +249,7 @@ static void
 	fd = 0;	// 全fdを先頭から確認
 	while (fd <= server->max_fd) {
 		if (fd != server->listen_fd && fd != except_fd && FD_ISSET(fd, &server->active_fds)) {
-			server->clients[fd].output = str_join(server->clients[fd].output, text);	// 配布関数で送信待ちへ追加
+			server->clients[fd].output = str_join(server->clients[fd].output, text);
 			if (!server->clients[fd].output) {
 				fatal_error();	// str_joinのmalloc失敗
 			}
@@ -282,66 +258,3 @@ static void
 	}
 }
 
-/* ************************************************************************** */
-// 配布main.cの関数。bufから改行までをmessageへ切り出す。
-static int
-	extract_message(char** buf, char** message)
-{
-	char*	newbuf;
-	int		i;
-
-	*message = NULL;	// まだ取り出したメッセージはない
-	if (*buf == NULL) {
-		return (0);	// 受信文字列自体がない
-	}
-	i = 0;
-	while ((*buf)[i]) {
-		if ((*buf)[i] == '\n') {
-			newbuf = calloc(1, strlen(*buf + i + 1) + 1);	// 改行後の保存領域
-			if (!newbuf) {
-				return (-1);	// 呼び出し側でFatal errorにする
-			}
-			strcpy(newbuf, *buf + i + 1);	// 改行より後ろを保存
-			*message = *buf;	// 古いbufの所有権をmessageへ渡す
-			(*message)[i + 1] = '\0';	// 改行を含む1行で終端
-			*buf = newbuf;	// 未完成部分を次回へ持ち越す
-			return (1);	// 1行取り出せた
-		}
-		i++;
-	}
-	return (0);	// 改行がないので次のrecvを待つ
-}
-
-/* ************************************************************************** */
-// 配布main.cの関数。bufの末尾へaddを連結し、古いbufを解放する。
-static char*
-	str_join(char* buf, const char* add)
-{
-	char*	newbuf;
-	int		length;
-
-	length = 0;	// bufがNULLなら既存長は0
-	if (buf) {
-		length = strlen(buf);	// 既存文字列の長さ
-	}
-	newbuf = malloc(length + strlen(add) + 1);	// 連結後の大きさを確保
-	if (!newbuf) {
-		return (NULL);	// 呼び出し側でFatal errorにする
-	}
-	newbuf[0] = '\0';	// strcatできる空文字列にする
-	if (buf) {
-		strcat(newbuf, buf);	// 既存文字列をコピー
-	}
-	free(buf);	// 古い領域は不要
-	strcat(newbuf, add);	// 追加文字列を末尾へ連結
-	return (newbuf);
-}
-
-/* ************************************************************************** */
-// 致命的エラーを標準エラーへ出して終了する。
-static void
-	fatal_error(void)
-{
-	write(2, "Fatal error\n", 12);	// 標準エラーへ固定文言を出す
-	exit(1);	// ステータス1で即終了
-}
